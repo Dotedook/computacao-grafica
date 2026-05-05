@@ -7,7 +7,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(FetchContent)
 
-# GLFW is fetched automatically so the project builds on a clean machine.
 FetchContent_Declare(
   glfw
   GIT_REPOSITORY https://github.com/glfw/glfw.git
@@ -15,9 +14,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glfw)
 
+FetchContent_Declare(
+  glm
+  GIT_REPOSITORY https://github.com/g-truc/glm.git
+  GIT_TAG 1.0.1
+)
+FetchContent_MakeAvailable(glm)
+
 add_executable(Hello3D src/Hello3D.cpp)
 
-target_link_libraries(Hello3D PRIVATE glfw)
+target_link_libraries(Hello3D PRIVATE glfw glm::glm)
 
 if(APPLE)
   target_link_libraries(Hello3D PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
