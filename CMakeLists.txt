@@ -21,8 +21,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm)
 
+FetchContent_Declare(
+  stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG master
+)
+FetchContent_MakeAvailable(stb)
+
 add_executable(Hello3D src/Hello3D.cpp)
 
+target_include_directories(Hello3D PRIVATE ${stb_SOURCE_DIR})
 target_link_libraries(Hello3D PRIVATE glfw glm::glm)
 
 if(APPLE)

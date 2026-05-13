@@ -7,6 +7,9 @@
 #include <cmath>
 #include <filesystem>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 #define GL_SILENCE_DEPRECATION
 #define GLFW_INCLUDE_GLCOREARB
 #include <GLFW/glfw3.h>
@@ -33,6 +36,7 @@ constexpr int kPaletteSize = 6;
 struct SceneObject {
     std::string name;
     GLuint      vao = 0, vbo = 0;
+    GLuint      textureId = 0;
     int         vertexCount = 0;
     glm::vec3   position{0.0f};
     glm::vec3   rotation{0.0f};
@@ -45,18 +49,28 @@ int gSelected = 0;
 
 // ---- OBJ loader ----
 
-struct FaceIdx { int v = 0; };
+struct FaceIdx { int v = 0, t = -1, n = -1; };
 
 FaceIdx ParseFaceToken(const std::string& tok)
 {
     FaceIdx fi;
-    size_t slash = tok.find('/');
-    std::string vstr = (slash != std::string::npos) ? tok.substr(0, slash) : tok;
-    if (!vstr.empty()) fi.v = std::stoi(vstr);
+    std::istringstream ss(tok);
+    std::string index;
+    if (std::getline(ss, index, '/')) {
+        if (!index.empty()) fi.v = std::stoi(index) - 1;
+    }
+    if (std::getline(ss, index, '/')) {
+        if (!index.empty()) fi.t = std::stoi(index) - 1;
+    }
+    if (std::getline(ss, index)) {
+        if (!index.empty()) fi.n = std::stoi(index) - 1;
+    }
     return fi;
 }
 
-std::vector<float> LoadOBJ(const std::string& path, int& vertexCount, std::string& name)
+// Buffer layout: pos(3) + texcoord(2) + normal(3) = 8 floats/vertex
+std::vector<float> LoadOBJ(const std::string& path, int& vertexCount,
+                            std::string& name, std::string& mtlFile)
 {
     std::ifstream file(path);
     if (!file) {
@@ -65,7 +79,6 @@ std::vector<float> LoadOBJ(const std::string& path, int& vertexCount, std::strin
         return {};
     }
 
-    // Extract name from filename
     size_t slash = path.find_last_of("/\\");
     size_t dot   = path.find_last_of('.');
     name = (slash != std::string::npos && dot > slash)
@@ -73,7 +86,10 @@ std::vector<float> LoadOBJ(const std::string& path, int& vertexCount, std::strin
                : path;
 
     std::vector<glm::vec3> positions;
+    std::vector<glm::vec2> texCoords;
+    std::vector<glm::vec3> normals;
     std::vector<float>     out;
+    mtlFile.clear();
 
     std::string line;
     while (std::getline(file, line)) {
@@ -82,24 +98,37 @@ std::vector<float> LoadOBJ(const std::string& path, int& vertexCount, std::strin
         std::string tok;
         ss >> tok;
 
-        if (tok == "v") {
+        if (tok == "mtllib") {
+            ss >> mtlFile;
+        } else if (tok == "v") {
             float x, y, z;
             ss >> x >> y >> z;
             positions.push_back({x, y, z});
+        } else if (tok == "vt") {
+            float s, t;
+            ss >> s >> t;
+            texCoords.push_back({s, t});
+        } else if (tok == "vn") {
+            float x, y, z;
+            ss >> x >> y >> z;
+            normals.push_back({x, y, z});
         } else if (tok == "f") {
             std::vector<FaceIdx> fv;
             std::string s;
             while (ss >> s) fv.push_back(ParseFaceToken(s));
             if (fv.size() < 3) continue;
-            // Fan triangulation — handles quads and n-gons
             auto addVert = [&](const FaceIdx& fi) {
-                int vi = fi.v > 0 ? fi.v - 1 : (int)positions.size() + fi.v;
-                if (vi >= 0 && vi < (int)positions.size()) {
-                    out.push_back(positions[vi].x);
-                    out.push_back(positions[vi].y);
-                    out.push_back(positions[vi].z);
-                }
+                if (fi.v < 0 || fi.v >= (int)positions.size()) return;
+                glm::vec3 pos = positions[fi.v];
+                glm::vec2 tc  = (fi.t >= 0 && fi.t < (int)texCoords.size())
+                                    ? texCoords[fi.t] : glm::vec2(0.0f, 0.0f);
+                glm::vec3 nm  = (fi.n >= 0 && fi.n < (int)normals.size())
+                                    ? normals[fi.n] : glm::vec3(0.0f, 0.0f, 1.0f);
+                out.push_back(pos.x); out.push_back(pos.y); out.push_back(pos.z);
+                out.push_back(tc.s);  out.push_back(tc.t);
+                out.push_back(nm.x);  out.push_back(nm.y);  out.push_back(nm.z);
             };
+            // Fan triangulation — handles quads and n-gons
             for (int i = 1; i + 1 < (int)fv.size(); i++) {
                 addVert(fv[0]);
                 addVert(fv[i]);
@@ -108,15 +137,58 @@ std::vector<float> LoadOBJ(const std::string& path, int& vertexCount, std::strin
         }
     }
 
-    vertexCount = (int)out.size() / 3;
+    vertexCount = (int)out.size() / 8;
     return out;
+}
+
+// Returns texture filename from map_Kd in the MTL file
+std::string ParseMTL(const std::string& mtlPath)
+{
+    std::ifstream file(mtlPath);
+    if (!file) return {};
+    std::string line, texFile;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string tok;
+        ss >> tok;
+        if (tok == "map_Kd") {
+            ss >> texFile;
+            break;
+        }
+    }
+    return texFile;
+}
+
+GLuint LoadTexture(const std::string& path)
+{
+    stbi_set_flip_vertically_on_load(true);
+    int w, h, ch;
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, 0);
+    if (!data) {
+        std::cerr << "Failed to load texture: " << path << '\n';
+        return 0;
+    }
+    GLenum fmt = (ch == 4) ? GL_RGBA : GL_RGB;
+    GLuint id;
+    glGenTextures(1, &id);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glTexImage2D(GL_TEXTURE_2D, 0, (GLint)fmt, w, h, 0, fmt, GL_UNSIGNED_BYTE, data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(data);
+    return id;
 }
 
 bool UploadObject(const std::string& path, int paletteIdx)
 {
     int         vertCount = 0;
-    std::string name;
-    auto        verts = LoadOBJ(path, vertCount, name);
+    std::string name, mtlFile;
+    auto        verts = LoadOBJ(path, vertCount, name, mtlFile);
     if (vertCount == 0) return false;
 
     SceneObject obj;
@@ -124,14 +196,30 @@ bool UploadObject(const std::string& path, int paletteIdx)
     obj.vertexCount = vertCount;
     obj.color       = kPalette[paletteIdx % kPaletteSize];
 
+    if (!mtlFile.empty()) {
+        std::string objDir;
+        size_t slash = path.find_last_of("/\\");
+        if (slash != std::string::npos) objDir = path.substr(0, slash + 1);
+        std::string texFile = ParseMTL(objDir + mtlFile);
+        if (!texFile.empty())
+            obj.textureId = LoadTexture(objDir + texFile);
+    }
+
     glGenVertexArrays(1, &obj.vao);
     glGenBuffers(1, &obj.vbo);
     glBindVertexArray(obj.vao);
     glBindBuffer(GL_ARRAY_BUFFER, obj.vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts.size() * sizeof(float)),
                  verts.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+
+    constexpr GLsizei stride = 8 * sizeof(float);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (GLvoid*)0);
     glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (GLvoid*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, (GLvoid*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 
@@ -211,12 +299,10 @@ void ProcessContinuousInput(GLFWwindow* window, float dt)
     const float moveSpeed  = 2.0f * dt;
     const float scaleSpeed = 0.8f * dt;
 
-    // Rotation — X Y Z axes
     if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS) obj.rotation.x += rotSpeed;
     if (glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS) obj.rotation.y += rotSpeed;
     if (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS) obj.rotation.z += rotSpeed;
 
-    // Translation — WASD (X/Z plane), arrow Up/Down (Y axis)
     if (glfwGetKey(window, GLFW_KEY_D)    == GLFW_PRESS) obj.position.x += moveSpeed;
     if (glfwGetKey(window, GLFW_KEY_A)    == GLFW_PRESS) obj.position.x -= moveSpeed;
     if (glfwGetKey(window, GLFW_KEY_W)    == GLFW_PRESS) obj.position.z -= moveSpeed;
@@ -224,13 +310,11 @@ void ProcessContinuousInput(GLFWwindow* window, float dt)
     if (glfwGetKey(window, GLFW_KEY_UP)   == GLFW_PRESS) obj.position.y += moveSpeed;
     if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS) obj.position.y -= moveSpeed;
 
-    // Uniform scale — ] up, [ down
     if (glfwGetKey(window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS)
         obj.scale += glm::vec3(scaleSpeed);
     if (glfwGetKey(window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS)
         obj.scale = glm::max(obj.scale - glm::vec3(scaleSpeed), glm::vec3(0.05f));
 
-    // Per-axis scale — hold Shift + X/Y/Z to grow, Ctrl + X/Y/Z to shrink
     bool shift = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS ||
                  glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
     bool ctrl  = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL)  == GLFW_PRESS ||
@@ -279,22 +363,37 @@ int main(int argc, char** argv)
     glfwSwapInterval(1);
     glfwSetKeyCallback(window, KeyCallback);
 
-    // Shaders: position-only vertices, flat color per object
     const char* vertSrc = R"(
         #version 330 core
         layout(location = 0) in vec3 aPos;
+        layout(location = 1) in vec2 aTexCoord;
+        layout(location = 2) in vec3 aNormal;
         uniform mat4 uModel;
         uniform mat4 uView;
         uniform mat4 uProjection;
+        out vec2 vTexCoord;
+        out vec3 vNormal;
         void main() {
             gl_Position = uProjection * uView * uModel * vec4(aPos, 1.0);
+            vTexCoord = aTexCoord;
+            vNormal = mat3(transpose(inverse(uModel))) * aNormal;
         }
     )";
     const char* fragSrc = R"(
         #version 330 core
+        in vec2 vTexCoord;
+        in vec3 vNormal;
+        uniform sampler2D uTexture;
         uniform vec3 uColor;
+        uniform bool uHasTexture;
         out vec4 FragColor;
-        void main() { FragColor = vec4(uColor, 1.0); }
+        void main() {
+            if (uHasTexture) {
+                FragColor = texture(uTexture, vTexCoord);
+            } else {
+                FragColor = vec4(uColor, 1.0);
+            }
+        }
     )";
 
     GLuint program = CreateProgram(vertSrc, fragSrc);
@@ -304,10 +403,11 @@ int main(int argc, char** argv)
     GLint locView       = glGetUniformLocation(program, "uView");
     GLint locProjection = glGetUniformLocation(program, "uProjection");
     GLint locColor      = glGetUniformLocation(program, "uColor");
+    GLint locHasTex     = glGetUniformLocation(program, "uHasTexture");
+    GLint locTexture    = glGetUniformLocation(program, "uTexture");
 
     glEnable(GL_DEPTH_TEST);
 
-    // Collect OBJ paths: command-line args, then scan assets/
     std::vector<std::string> objPaths;
     for (int i = 1; i < argc; i++)
         objPaths.push_back(argv[i]);
@@ -345,8 +445,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Space objects evenly along X so they don't overlap at start
-    float spacing = 2.5f;
+    float spacing   = 2.5f;
     float totalSpan = spacing * ((int)gObjects.size() - 1);
     for (int i = 0; i < (int)gObjects.size(); i++)
         gObjects[i].position.x = -totalSpan * 0.5f + i * spacing;
@@ -366,7 +465,6 @@ int main(int argc, char** argv)
         glfwPollEvents();
         ProcessContinuousInput(window, dt);
 
-        // Window title with active object info
         {
             const auto& sel = gObjects[gSelected];
             std::string title =
@@ -389,6 +487,7 @@ int main(int argc, char** argv)
         glUseProgram(program);
         glUniformMatrix4fv(locView,       1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(locProjection, 1, GL_FALSE, glm::value_ptr(proj));
+        glUniform1i(locTexture, 0);
 
         for (int i = 0; i < (int)gObjects.size(); i++) {
             const auto& obj = gObjects[i];
@@ -403,8 +502,14 @@ int main(int argc, char** argv)
 
             glBindVertexArray(obj.vao);
 
-            // Solid fill — dim unselected objects
+            bool hasTex = (obj.textureId != 0);
+            if (hasTex) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, obj.textureId);
+            }
+
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            glUniform1i(locHasTex, hasTex ? GL_TRUE : GL_FALSE);
             float     dim = (i == gSelected) ? 1.0f : 0.50f;
             glm::vec3 c   = obj.color * dim;
             glUniform3fv(locColor, 1, glm::value_ptr(c));
@@ -415,6 +520,7 @@ int main(int argc, char** argv)
                 glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
                 glEnable(GL_POLYGON_OFFSET_LINE);
                 glPolygonOffset(-1.0f, -1.0f);
+                glUniform1i(locHasTex, GL_FALSE);
                 glm::vec3 wc{1.0f, 0.92f, 0.25f};
                 glUniform3fv(locColor, 1, glm::value_ptr(wc));
                 glDrawArrays(GL_TRIANGLES, 0, obj.vertexCount);
@@ -422,6 +528,7 @@ int main(int argc, char** argv)
                 glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             }
 
+            if (hasTex) glBindTexture(GL_TEXTURE_2D, 0);
             glBindVertexArray(0);
         }
 
@@ -431,6 +538,7 @@ int main(int argc, char** argv)
     for (auto& obj : gObjects) {
         glDeleteBuffers(1, &obj.vbo);
         glDeleteVertexArrays(1, &obj.vao);
+        if (obj.textureId) glDeleteTextures(1, &obj.textureId);
     }
     glDeleteProgram(program);
     glfwDestroyWindow(window);
